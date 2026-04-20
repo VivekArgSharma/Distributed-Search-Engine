@@ -3,6 +3,7 @@ package crawler
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +21,6 @@ type Crawler struct {
 	maxPages   int
 	maxDepth   int
 	baseDomain string
-	rateLimit  time.Duration
 
 	visited map[string]bool
 	mu      sync.Mutex
@@ -29,17 +29,19 @@ type Crawler struct {
 	wg   sync.WaitGroup
 
 	pageCount int
+
+	rateLimiter <-chan time.Time // global rate limiter
 }
 
-func NewCrawler(workers, maxPages, maxDepth int, rateLimit time.Duration, baseDomain string) *Crawler {
+func NewCrawler(workers, maxPages, maxDepth int, rate time.Duration, baseDomain string) *Crawler {
 	return &Crawler{
-		maxWorkers: workers,
-		maxPages:   maxPages,
-		maxDepth:   maxDepth,
-		baseDomain: baseDomain,
-		rateLimit:  rateLimit,
-		visited:    make(map[string]bool),
-		jobs:       make(chan URLJob, 100),
+		maxWorkers:  workers,
+		maxPages:    maxPages,
+		maxDepth:    maxDepth,
+		baseDomain:  baseDomain,
+		visited:     make(map[string]bool),
+		jobs:        make(chan URLJob, 200),
+		rateLimiter: time.Tick(rate),
 	}
 }
 
@@ -72,21 +74,20 @@ func (c *Crawler) process(job URLJob, workerID int) {
 		return
 	}
 
+	<-c.rateLimiter // GLOBAL rate limit
+
 	fmt.Printf("[Worker %d] Fetching: %s (Depth %d)\n", workerID, job.URL, job.Depth)
 
 	client := http.Client{Timeout: 5 * time.Second}
 
-	// Create request manually
 	req, err := http.NewRequest("GET", job.URL, nil)
 	if err != nil {
 		fmt.Println("Request error:", err)
 		return
 	}
 
-	// Add User-Agent (IMPORTANT)
 	req.Header.Set("User-Agent", "VivekSearchBot/1.0 (learning project)")
 
-	// Send request
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Println("Error:", err)
@@ -108,17 +109,64 @@ func (c *Crawler) process(job URLJob, workerID int) {
 	fmt.Println("Text preview:", preview)
 	fmt.Println("Links found:", len(parsed.Links))
 
+	count := 0
 	for _, link := range parsed.Links {
+
+		// limit explosion per page
+		if count >= 50 {
+			break
+		}
+		count++
+
+		if !c.validLink(link) {
+			continue
+		}
+
 		if c.canAddMore() {
 			c.wg.Add(1)
-			c.jobs <- URLJob{
+
+			// NON-BLOCKING SEND → prevents deadlock
+			select {
+			case c.jobs <- URLJob{
 				URL:   link,
 				Depth: job.Depth + 1,
+			}:
+			default:
+				// queue full → drop safely
+				c.wg.Done()
 			}
 		}
 	}
+}
 
-	time.Sleep(c.rateLimit)
+func (c *Crawler) validLink(link string) bool {
+	// domain restriction (safe version)
+	u, err := url.Parse(link)
+	if err != nil {
+		return false
+	}
+
+	if u.Hostname() != "en.wikipedia.org" {
+		return false
+	}
+
+	// remove fragments
+	if strings.Contains(link, "#") {
+		return false
+	}
+
+	// keep only wiki pages
+	if !strings.Contains(link, "/wiki/") {
+		return false
+	}
+
+	// skip special pages
+	parts := strings.Split(link, "/wiki/")
+	if len(parts) > 1 && strings.Contains(parts[1], ":") {
+		return false
+	}
+
+	return true
 }
 
 func (c *Crawler) shouldVisit(job URLJob) bool {
@@ -137,27 +185,6 @@ func (c *Crawler) shouldVisit(job URLJob) bool {
 		return false
 	}
 
-	// Domain restriction
-	if !strings.Contains(job.URL, c.baseDomain) {
-		return false
-	}
-
-	// Remove fragments (#section)
-	if strings.Contains(job.URL, "#") {
-		return false
-	}
-
-	// Only Wikipedia article pages
-	if !strings.Contains(job.URL, "/wiki/") {
-		return false
-	}
-
-	// Skip special pages (Portal:, Wikipedia:, File:, etc)
-	parts := strings.Split(job.URL, "/wiki/")
-	if len(parts) > 1 && strings.Contains(parts[1], ":") {
-		return false
-	}
-
 	c.visited[job.URL] = true
 	c.pageCount++
 	return true
@@ -166,6 +193,5 @@ func (c *Crawler) shouldVisit(job URLJob) bool {
 func (c *Crawler) canAddMore() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	return c.pageCount < c.maxPages
 }
