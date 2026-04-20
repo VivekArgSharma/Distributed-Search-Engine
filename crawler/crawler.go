@@ -1,7 +1,9 @@
 package crawler
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,136 +18,163 @@ type URLJob struct {
 	Depth int
 }
 
+type Page struct {
+	URL   string
+	Depth int
+	Body  []byte
+}
+
 type Crawler struct {
 	maxWorkers int
 	maxPages   int
 	maxDepth   int
-	baseDomain string
 
 	visited map[string]bool
 	mu      sync.Mutex
 
-	jobs chan URLJob
-	wg   sync.WaitGroup
+	jobs  chan URLJob
+	pages chan Page
+
+	wg sync.WaitGroup
 
 	pageCount int
 
-	rateLimiter <-chan time.Time // global rate limiter
+	rateLimiter <-chan time.Time
 }
 
-func NewCrawler(workers, maxPages, maxDepth int, rate time.Duration, baseDomain string) *Crawler {
+func NewCrawler(workers, maxPages, maxDepth int, rate time.Duration) *Crawler {
 	return &Crawler{
 		maxWorkers:  workers,
 		maxPages:    maxPages,
 		maxDepth:    maxDepth,
-		baseDomain:  baseDomain,
 		visited:     make(map[string]bool),
-		jobs:        make(chan URLJob, 200),
+		jobs:        make(chan URLJob, 1000),
+		pages:       make(chan Page, 1000),
 		rateLimiter: time.Tick(rate),
 	}
 }
 
 func (c *Crawler) Start(seedURLs []string) {
+
+	// start fetch workers
 	for i := 0; i < c.maxWorkers; i++ {
-		go c.worker(i)
+		go c.fetchWorker(i)
 	}
 
+	// start parser workers
+	for i := 0; i < c.maxWorkers; i++ {
+		go c.parseWorker(i)
+	}
+
+	// seed URLs
 	for _, u := range seedURLs {
 		c.wg.Add(1)
 		c.jobs <- URLJob{URL: u, Depth: 0}
 	}
 
 	c.wg.Wait()
+
 	close(c.jobs)
+	close(c.pages)
 
 	fmt.Println("Crawling finished")
 }
 
-func (c *Crawler) worker(id int) {
+func (c *Crawler) fetchWorker(id int) {
 	for job := range c.jobs {
-		c.process(job, id)
-	}
-}
 
-func (c *Crawler) process(job URLJob, workerID int) {
-	defer c.wg.Done()
-
-	if !c.shouldVisit(job) {
-		return
-	}
-
-	<-c.rateLimiter // GLOBAL rate limit
-
-	fmt.Printf("[Worker %d] Fetching: %s (Depth %d)\n", workerID, job.URL, job.Depth)
-
-	client := http.Client{Timeout: 5 * time.Second}
-
-	req, err := http.NewRequest("GET", job.URL, nil)
-	if err != nil {
-		fmt.Println("Request error:", err)
-		return
-	}
-
-	req.Header.Set("User-Agent", "VivekSearchBot/1.0 (learning project)")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("Error:", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	fmt.Printf("[Worker %d] Done: %s (%d)\n", workerID, job.URL, resp.StatusCode)
-
-	parsed := parser.Parse(resp.Body, job.URL)
-
-	// Safe preview
-	preview := parsed.Text
-	if len(preview) > 100 {
-		preview = preview[:100]
-	}
-
-	fmt.Println("Title:", parsed.Title)
-	fmt.Println("Text preview:", preview)
-	fmt.Println("Links found:", len(parsed.Links))
-
-	count := 0
-	for _, link := range parsed.Links {
-
-		// limit explosion per page
-		if count >= 50 {
-			break
-		}
-		count++
-
-		if !c.validLink(link) {
+		if !c.shouldVisit(job) {
+			c.wg.Done()
 			continue
 		}
 
-		if c.canAddMore() {
-			c.wg.Add(1)
+		<-c.rateLimiter // rate limit
 
-			// NON-BLOCKING SEND → prevents deadlock
-			select {
-			case c.jobs <- URLJob{
-				URL:   link,
-				Depth: job.Depth + 1,
-			}:
-			default:
-				// queue full → drop safely
-				c.wg.Done()
-			}
+		client := http.Client{Timeout: 5 * time.Second}
+
+		req, err := http.NewRequest("GET", job.URL, nil)
+		if err != nil {
+			c.wg.Done()
+			continue
+		}
+
+		req.Header.Set("User-Agent", "VivekSearchBot/1.0")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			c.wg.Done()
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			c.wg.Done()
+			continue
+		}
+
+		fmt.Printf("[Fetcher %d] %s\n", id, job.URL)
+
+		// send to parser
+		select {
+		case c.pages <- Page{
+			URL:   job.URL,
+			Depth: job.Depth,
+			Body:  body,
+		}:
+		default:
+			// drop if full
+			c.wg.Done()
 		}
 	}
 }
 
+func (c *Crawler) parseWorker(id int) {
+	for page := range c.pages {
+
+		reader := bytes.NewReader(page.Body)
+		parsed := parser.Parse(reader, page.URL)
+
+		fmt.Printf("[Parser %d] %s\n", id, parsed.Title)
+
+		count := 0
+		for _, link := range parsed.Links {
+
+			// limit explosion
+			if count >= 100 {
+				break
+			}
+			count++
+
+			if !c.validLink(link) {
+				continue
+			}
+
+			if c.canAddMore() {
+				c.wg.Add(1)
+
+				select {
+				case c.jobs <- URLJob{
+					URL:   link,
+					Depth: page.Depth + 1,
+				}:
+				default:
+					// drop safely
+					c.wg.Done()
+				}
+			}
+		}
+
+		c.wg.Done()
+	}
+}
 func (c *Crawler) validLink(link string) bool {
-	// domain restriction (safe version)
 	u, err := url.Parse(link)
 	if err != nil {
 		return false
 	}
 
+	// restrict to English Wikipedia
 	if u.Hostname() != "en.wikipedia.org" {
 		return false
 	}
@@ -155,12 +184,12 @@ func (c *Crawler) validLink(link string) bool {
 		return false
 	}
 
-	// keep only wiki pages
+	// only article pages
 	if !strings.Contains(link, "/wiki/") {
 		return false
 	}
 
-	// skip special pages
+	//skip special pages
 	parts := strings.Split(link, "/wiki/")
 	if len(parts) > 1 && strings.Contains(parts[1], ":") {
 		return false
