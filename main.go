@@ -100,13 +100,15 @@ func main() {
 
 	fmt.Printf("\nIndexed %d documents in %v\n", idx.DocCount(), time.Since(start))
 
-	fmt.Println("\n=== Search: 'programming' ===")
-	for _, r := range idx.Search("programming", 5) {
+	results, dur := idx.Search("programming", 5)
+	fmt.Printf("\n=== Search: 'programming' (took %v) ===\n", dur)
+	for _, r := range results {
 		fmt.Printf("[%.2f] %s\n  %s\n\n", r.Score, r.Title, r.URL)
 	}
 
-	fmt.Println("=== Search: 'concurrency' ===")
-	for _, r := range idx.Search("concurrency", 5) {
+	results, dur = idx.Search("concurrency", 5)
+	fmt.Printf("=== Search: 'concurrency' (took %v) ===\n", dur)
+	for _, r := range results {
 		fmt.Printf("[%.2f] %s\n  %s\n\n", r.Score, r.Title, r.URL)
 	}
 

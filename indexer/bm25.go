@@ -3,6 +3,7 @@ package indexer
 import (
 	"math"
 	"strings"
+	"time"
 )
 
 type BM25 struct {
@@ -19,7 +20,13 @@ func NewBM25(idx *Indexer) *BM25 {
 	}
 }
 
-func (bm *BM25) Search(query string, limit int) []SearchResult {
+func (bm *BM25) Search(query string, limit int) ([]SearchResult, time.Duration) {
+	start := time.Now()
+	results := bm.search(query, limit)
+	return results, time.Since(start)
+}
+
+func (bm *BM25) search(query string, limit int) []SearchResult {
 	queryTokens := bm.idx.tokenize(query)
 	if len(queryTokens) == 0 {
 		return nil

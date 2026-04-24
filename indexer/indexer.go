@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"search-engine/parser"
 )
@@ -95,7 +96,13 @@ func (idx *Indexer) tokenize(text string) []string {
 	return filtered
 }
 
-func (idx *Indexer) Search(query string, limit int) []SearchResult {
+func (idx *Indexer) Search(query string, limit int) ([]SearchResult, time.Duration) {
+	start := time.Now()
+	results := idx.search(query, limit)
+	return results, time.Since(start)
+}
+
+func (idx *Indexer) search(query string, limit int) []SearchResult {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 

@@ -33,20 +33,20 @@ func TestBM25(t *testing.T) {
 	bm25 := NewBM25(idx)
 
 	fmt.Println("\n=== BM25 Search: 'Go programming' ===")
-	results := bm25.Search("Go programming", 3)
+	results, _ := bm25.Search("Go programming", 3)
 	for _, r := range results {
 		fmt.Printf("[%.2f] %s\n", r.Score, r.Title)
 	}
 
 	fmt.Println("\n=== BM25 vs TF-IDF: 'apple' ===")
-	bmResults := bm25.Search("apple", 4)
-	tfResults := idx.Search("apple", 4)
+	bmResults, _ := bm25.Search("apple", 4)
+	tfResults, tfTime := idx.Search("apple", 4)
 
 	fmt.Println("BM25:")
 	for _, r := range bmResults {
 		fmt.Printf("[%.2f] %s\n", r.Score, r.Title)
 	}
-	fmt.Println("TF-IDF:")
+	fmt.Printf("TF-IDF (took %v):\n", tfTime)
 	for _, r := range tfResults {
 		fmt.Printf("[%.2f] %s\n", r.Score, r.Title)
 	}
@@ -68,13 +68,13 @@ func TestBM25OnSavedIndex(t *testing.T) {
 	bm25 := NewBM25(idx)
 
 	fmt.Println("=== BM25 Search: 'programming' ===")
-	results := bm25.Search("programming", 5)
+	results, _ := bm25.Search("programming", 5)
 	for _, r := range results {
 		fmt.Printf("[%.2f] %s\n  %s\n", r.Score, r.Title, r.URL)
 	}
 
 	fmt.Println("\n=== BM25 Search: 'concurrency' ===")
-	results = bm25.Search("concurrency", 5)
+	results, _ = bm25.Search("concurrency", 5)
 	for _, r := range results {
 		fmt.Printf("[%.2f] %s\n  %s\n", r.Score, r.Title, r.URL)
 	}

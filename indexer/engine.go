@@ -3,6 +3,7 @@ package indexer
 import (
 	"bytes"
 	"fmt"
+	"time"
 
 	"search-engine/crawler"
 	"search-engine/parser"
@@ -46,7 +47,7 @@ func (e *Engine) CrawlAndIndex(seeds []string) {
 	fmt.Printf("Indexed %d documents\n", e.indexer.DocCount())
 }
 
-func (e *Engine) Search(query string, limit int) []SearchResult {
+func (e *Engine) Search(query string, limit int) ([]SearchResult, time.Duration) {
 	return e.indexer.Search(query, limit)
 }
 
