@@ -2,10 +2,9 @@ package crawler
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"net/http"
-	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -13,214 +12,102 @@ import (
 	"search-engine/parser"
 )
 
-type URLJob struct {
-	URL   string
-	Depth int
-}
-
-type Page struct {
-	URL   string
-	Depth int
-	Body  []byte
-}
-
 type Crawler struct {
-	maxWorkers int
-	maxPages   int
-	maxDepth   int
+	client    *http.Client
+	userAgent string
+	rateLimit time.Duration
 
-	visited map[string]bool
 	mu      sync.Mutex
-
-	jobs  chan URLJob
-	pages chan Page
-
-	wg sync.WaitGroup
-
-	pageCount int
-
-	rateLimiter <-chan time.Time
+	visited map[string]bool
+	checked int
 }
 
-func NewCrawler(workers, maxPages, maxDepth int, rate time.Duration) *Crawler {
+func NewCrawler(userAgent string, rateLimit time.Duration) *Crawler {
 	return &Crawler{
-		maxWorkers:  workers,
-		maxPages:    maxPages,
-		maxDepth:    maxDepth,
-		visited:     make(map[string]bool),
-		jobs:        make(chan URLJob, 1000),
-		pages:       make(chan Page, 1000),
-		rateLimiter: time.Tick(rate),
+		client:    &http.Client{Timeout: 15 * time.Second},
+		userAgent: userAgent,
+		rateLimit: rateLimit,
+		visited:   make(map[string]bool),
 	}
 }
 
-func (c *Crawler) Start(seedURLs []string) {
-
-	// start fetch workers
-	for i := 0; i < c.maxWorkers; i++ {
-		go c.fetchWorker(i)
+func (c *Crawler) Fetch(url string) ([]byte, error) {
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", c.userAgent)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
 	}
-
-	// start parser workers
-	for i := 0; i < c.maxWorkers; i++ {
-		go c.parseWorker(i)
-	}
-
-	// seed URLs
-	for _, u := range seedURLs {
-		c.wg.Add(1)
-		c.jobs <- URLJob{URL: u, Depth: 0}
-	}
-
-	c.wg.Wait()
-
-	close(c.jobs)
-	close(c.pages)
-
-	fmt.Println("Crawling finished")
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
 }
 
-func (c *Crawler) fetchWorker(id int) {
-	for job := range c.jobs {
-
-		if !c.shouldVisit(job) {
-			c.wg.Done()
-			continue
-		}
-
-		<-c.rateLimiter // rate limit
-
-		client := http.Client{Timeout: 5 * time.Second}
-
-		req, err := http.NewRequest("GET", job.URL, nil)
-		if err != nil {
-			c.wg.Done()
-			continue
-		}
-
-		req.Header.Set("User-Agent", "VivekSearchBot/1.0")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			c.wg.Done()
-			continue
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			c.wg.Done()
-			continue
-		}
-
-		fmt.Printf("[Fetcher %d] %s\n", id, job.URL)
-
-		// send to parser
-		select {
-		case c.pages <- Page{
-			URL:   job.URL,
-			Depth: job.Depth,
-			Body:  body,
-		}:
-		default:
-			// drop if full
-			c.wg.Done()
-		}
+func (c *Crawler) FetchAndParse(url string) parser.ParsedPage {
+	body, err := c.Fetch(url)
+	if err != nil {
+		return parser.ParsedPage{}
 	}
+	return parser.Parse(bytes.NewReader(body), url)
 }
 
-func (c *Crawler) parseWorker(id int) {
-	for page := range c.pages {
+func (c *Crawler) ExtractLinks(body []byte) []string {
+	re := regexp.MustCompile(`href="(/wiki/[^"#:]+)"`)
+	matches := re.FindAllStringSubmatch(string(body), -1)
 
-		reader := bytes.NewReader(page.Body)
-		parsed := parser.Parse(reader, page.URL)
+	var links []string
+	for _, m := range matches {
+		if len(m) > 1 && !strings.Contains(m[1], ":") {
+			links = append(links, "https://en.wikipedia.org"+m[1])
+		}
+	}
+	return links
+}
 
-		fmt.Printf("[Parser %d] %s\n", id, parsed.Title)
+func (c *Crawler) Crawl(urls []string, onPage func(parser.ParsedPage), maxPages, depth int) int {
+	var wg sync.WaitGroup
 
-		count := 0
-		for _, link := range parsed.Links {
+	var crawl func(u string, d int)
+	crawl = func(u string, d int) {
+		c.mu.Lock()
+		if c.checked >= maxPages || c.visited[u] {
+			c.mu.Unlock()
+			return
+		}
+		c.visited[u] = true
+		c.checked++
+		c.mu.Unlock()
 
-			// limit explosion
-			if count >= 100 {
-				break
-			}
-			count++
+		body, err := c.Fetch(u)
+		if err != nil {
+			return
+		}
 
-			if !c.validLink(link) {
-				continue
-			}
+		parsed := parser.Parse(bytes.NewReader(body), u)
+		onPage(parsed)
 
-			if c.canAddMore() {
-				c.wg.Add(1)
-
-				select {
-				case c.jobs <- URLJob{
-					URL:   link,
-					Depth: page.Depth + 1,
-				}:
-				default:
-					// drop safely
-					c.wg.Done()
+		if d > 0 {
+			links := c.ExtractLinks(body)
+			for _, link := range links {
+				if c.checked < maxPages {
+					time.Sleep(c.rateLimit)
+					wg.Add(1)
+					go func(l string) {
+						defer wg.Done()
+						crawl(l, d-1)
+					}(link)
 				}
 			}
 		}
-
-		c.wg.Done()
-	}
-}
-func (c *Crawler) validLink(link string) bool {
-	u, err := url.Parse(link)
-	if err != nil {
-		return false
 	}
 
-	// restrict to English Wikipedia
-	if u.Hostname() != "en.wikipedia.org" {
-		return false
+	for _, url := range urls {
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+			crawl(u, depth)
+		}(url)
 	}
 
-	// remove fragments
-	if strings.Contains(link, "#") {
-		return false
-	}
-
-	// only article pages
-	if !strings.Contains(link, "/wiki/") {
-		return false
-	}
-
-	//skip special pages
-	parts := strings.Split(link, "/wiki/")
-	if len(parts) > 1 && strings.Contains(parts[1], ":") {
-		return false
-	}
-
-	return true
-}
-
-func (c *Crawler) shouldVisit(job URLJob) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.pageCount >= c.maxPages {
-		return false
-	}
-
-	if job.Depth > c.maxDepth {
-		return false
-	}
-
-	if c.visited[job.URL] {
-		return false
-	}
-
-	c.visited[job.URL] = true
-	c.pageCount++
-	return true
-}
-
-func (c *Crawler) canAddMore() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.pageCount < c.maxPages
+	wg.Wait()
+	return c.checked
 }
