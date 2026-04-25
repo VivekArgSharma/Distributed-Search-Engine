@@ -215,26 +215,9 @@ func (idx *ShardedIndexer) searchTFIDF(query string, limit int) []SearchResult {
 		return nil
 	}
 
-	docScores := make(map[string]float64)
-
-	for _, token := range queryTokens {
-		for _, shardID := range idx.shardIDs {
-			shard := idx.shards[shardID]
-			shard.mu.RLock()
-			postings := shard.invertedIndex[token]
-			if len(postings) == 0 {
-				shard.mu.RUnlock()
-				continue
-			}
-
-			idf := math.Log(float64(totalDocs) / float64(len(postings)))
-			for _, posting := range postings {
-				tf := 1 + math.Log(float64(posting.TF))
-				docScores[posting.DocID] += tf * idf
-			}
-			shard.mu.RUnlock()
-		}
-	}
+	docScores := idx.parallelScoreShards(func(shardID int, shard *Shard) map[string]float64 {
+		return idx.searchShardTFIDF(shard, queryTokens, totalDocs)
+	})
 
 	return idx.buildResults(docScores, queryTokens, limit)
 }
@@ -271,33 +254,9 @@ func (bm *BM25) search(query string, limit int) []SearchResult {
 		return nil
 	}
 
-	docScores := make(map[string]float64)
-
-	for _, token := range queryTokens {
-		for _, shardID := range bm.idx.shardIDs {
-			shard := bm.idx.shards[shardID]
-			shard.mu.RLock()
-			postings := shard.invertedIndex[token]
-			if len(postings) == 0 {
-				shard.mu.RUnlock()
-				continue
-			}
-
-			df := float64(len(postings))
-			idf := math.Log((float64(totalDocs)-df+0.5)/(df+0.5) + 1)
-			for _, posting := range postings {
-				doc := shard.documents[posting.DocID]
-				if doc == nil {
-					continue
-				}
-				tf := float64(posting.TF)
-				dl := float64(len(doc.Tokens))
-				tfScore := (tf * (bm.k1 + 1)) / (tf + bm.k1*(1-bm.b+bm.b*dl/avgDL))
-				docScores[posting.DocID] += tfScore * idf
-			}
-			shard.mu.RUnlock()
-		}
-	}
+	docScores := bm.idx.parallelScoreShards(func(shardID int, shard *Shard) map[string]float64 {
+		return bm.searchShardBM25(shard, queryTokens, totalDocs, avgDL)
+	})
 
 	return bm.idx.buildResults(docScores, queryTokens, limit)
 }
@@ -321,6 +280,90 @@ func (bm *BM25) avgDocLength() float64 {
 	}
 
 	return float64(totalLength) / float64(totalDocs)
+}
+
+func (idx *ShardedIndexer) parallelScoreShards(scoreFn func(shardID int, shard *Shard) map[string]float64) map[string]float64 {
+	type shardScores struct {
+		scores map[string]float64
+	}
+
+	results := make(chan shardScores, len(idx.shardIDs))
+	var wg sync.WaitGroup
+
+	for _, shardID := range idx.shardIDs {
+		shard := idx.shards[shardID]
+		if shard == nil {
+			continue
+		}
+
+		wg.Add(1)
+		go func(shardID int, shard *Shard) {
+			defer wg.Done()
+			results <- shardScores{scores: scoreFn(shardID, shard)}
+		}(shardID, shard)
+	}
+
+	wg.Wait()
+	close(results)
+
+	merged := make(map[string]float64)
+	for result := range results {
+		for docID, score := range result.scores {
+			merged[docID] += score
+		}
+	}
+
+	return merged
+}
+
+func (idx *ShardedIndexer) searchShardTFIDF(shard *Shard, queryTokens []string, totalDocs int) map[string]float64 {
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	localScores := make(map[string]float64)
+	for _, token := range queryTokens {
+		postings := shard.invertedIndex[token]
+		if len(postings) == 0 {
+			continue
+		}
+
+		idf := math.Log(float64(totalDocs) / float64(len(postings)))
+		for _, posting := range postings {
+			tf := 1 + math.Log(float64(posting.TF))
+			localScores[posting.DocID] += tf * idf
+		}
+	}
+
+	return localScores
+}
+
+func (bm *BM25) searchShardBM25(shard *Shard, queryTokens []string, totalDocs int, avgDL float64) map[string]float64 {
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	localScores := make(map[string]float64)
+	for _, token := range queryTokens {
+		postings := shard.invertedIndex[token]
+		if len(postings) == 0 {
+			continue
+		}
+
+		df := float64(len(postings))
+		idf := math.Log((float64(totalDocs)-df+0.5)/(df+0.5) + 1)
+		for _, posting := range postings {
+			doc := shard.documents[posting.DocID]
+			if doc == nil {
+				continue
+			}
+
+			tf := float64(posting.TF)
+			dl := float64(len(doc.Tokens))
+			tfScore := (tf * (bm.k1 + 1)) / (tf + bm.k1*(1-bm.b+bm.b*dl/avgDL))
+			localScores[posting.DocID] += tfScore * idf
+		}
+	}
+
+	return localScores
 }
 
 func (idx *ShardedIndexer) buildResults(docScores map[string]float64, queryTokens []string, limit int) []SearchResult {

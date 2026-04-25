@@ -11,6 +11,8 @@ import (
 
 func main() {
 	const totalShards = 16
+	const crawlLimit = 220
+	const crawlDepth = 2
 
 	idx := indexer.NewShardedIndexer(totalShards)
 	c := crawler.NewCrawler("VivekSearchBot/1.0", 100*time.Millisecond)
@@ -35,15 +37,16 @@ func main() {
 		}
 		idx.Index(page)
 		fmt.Printf("[%d] %s\n", idx.DocCount(), page.Title)
-	}, 80, 2)
+	}, crawlLimit, crawlDepth)
 
 	if err := idx.Save("./index_data"); err != nil {
 		panic(err)
 	}
 
 	fmt.Printf("\nCrawled %d pages\n", count)
-	fmt.Printf("Indexed %d documents in %v\n", idx.DocCount(), time.Since(start))
+	fmt.Printf("Indexed %d unique documents in %v\n", idx.DocCount(), time.Since(start))
 	fmt.Printf("Saved %d total shards to ./index_data\n", idx.TotalShards())
+	fmt.Printf("Crawl target: %d pages, depth: %d\n", crawlLimit, crawlDepth)
 
 	results, dur := idx.Search("programming", 5)
 	fmt.Printf("\nTF-IDF 'programming' took %v\n", dur)
