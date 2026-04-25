@@ -7,9 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"search-engine/parser"
@@ -30,18 +31,38 @@ type Posting struct {
 }
 
 type SearchResult struct {
-	DocID   string
-	URL     string
-	Title   string
-	Score   float64
-	Snippet string
+	DocID   string  `json:"doc_id"`
+	URL     string  `json:"url"`
+	Title   string  `json:"title"`
+	Score   float64 `json:"score"`
+	Snippet string  `json:"snippet"`
+}
+
+type SearchMode string
+
+const (
+	SearchModeTFIDF SearchMode = "tfidf"
+	SearchModeBM25  SearchMode = "bm25"
+)
+
+type scoredDoc struct {
+	docID string
+	score float64
+}
+
+type shardMetadata struct {
+	TotalShards  int
+	LoadedShards []int
+	DocCount     int
 }
 
 type ShardedIndexer struct {
-	shards    map[int]*Shard
-	numShards int32
-	docCount  int32
-	indexMu   sync.Mutex
+	totalShards int
+	shardIDs    []int
+	shards      map[int]*Shard
+	tokenizer   *regexp.Regexp
+	mu          sync.RWMutex
+	docCount    int
 }
 
 type Shard struct {
@@ -51,35 +72,86 @@ type Shard struct {
 	docCount      int
 }
 
-var tokenizer = regexp.MustCompile(`[a-zA-Z0-9]+`)
-
-func NewShardedIndexer(numShards int) *ShardedIndexer {
-	si := &ShardedIndexer{
-		shards:    make(map[int]*Shard),
-		numShards: int32(numShards),
+func NewShardedIndexer(totalShards int) *ShardedIndexer {
+	shardIDs := make([]int, totalShards)
+	for i := 0; i < totalShards; i++ {
+		shardIDs[i] = i
 	}
-
-	for i := 0; i < numShards; i++ {
-		si.shards[i] = &Shard{
-			documents:     make(map[string]*Document),
-			invertedIndex: make(map[string][]Posting),
-		}
-	}
-
-	return si
+	return NewShardedIndexerForShards(totalShards, shardIDs)
 }
 
-func (si *ShardedIndexer) Index(parsed parser.ParsedPage) {
-	docID := generateDocID(parsed.URL)
-	shardIdx := si.getShardIndex(docID)
+func NewShardedIndexerForShards(totalShards int, shardIDs []int) *ShardedIndexer {
+	ids := append([]int(nil), shardIDs...)
+	sort.Ints(ids)
 
-	shard := si.shards[shardIdx]
-	if shard == nil {
-		shard = &Shard{
-			documents:     make(map[string]*Document),
-			invertedIndex: make(map[string][]Posting),
+	idx := &ShardedIndexer{
+		totalShards: totalShards,
+		shardIDs:    ids,
+		shards:      make(map[int]*Shard, len(ids)),
+		tokenizer:   regexp.MustCompile(`[a-zA-Z0-9]+`),
+	}
+
+	for _, shardID := range ids {
+		idx.shards[shardID] = newShard()
+	}
+
+	return idx
+}
+
+func ParseShardIDs(raw string) ([]int, error) {
+	parts := strings.Split(raw, ",")
+	ids := make([]int, 0, len(parts))
+	seen := make(map[int]bool, len(parts))
+
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
 		}
-		si.shards[shardIdx] = shard
+
+		id, err := strconv.Atoi(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("invalid shard id %q: %w", trimmed, err)
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("no shard ids provided")
+	}
+
+	sort.Ints(ids)
+	return ids, nil
+}
+
+func (idx *ShardedIndexer) ShardIDs() []int {
+	return append([]int(nil), idx.shardIDs...)
+}
+
+func (idx *ShardedIndexer) TotalShards() int {
+	return idx.totalShards
+}
+
+func (idx *ShardedIndexer) NumShards() int {
+	return len(idx.shardIDs)
+}
+
+func (idx *ShardedIndexer) DocCount() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.docCount
+}
+
+func (idx *ShardedIndexer) Index(parsed parser.ParsedPage) {
+	docID := generateDocID(parsed.URL)
+	shardID := idx.getShardIndex(docID)
+	shard, ok := idx.shards[shardID]
+	if !ok {
+		return
 	}
 
 	shard.mu.Lock()
@@ -89,8 +161,7 @@ func (si *ShardedIndexer) Index(parsed parser.ParsedPage) {
 		return
 	}
 
-	tokens := si.tokenize(parsed.Text)
-
+	tokens := idx.tokenize(parsed.Text)
 	doc := &Document{
 		ID:     docID,
 		URL:    parsed.URL,
@@ -101,7 +172,6 @@ func (si *ShardedIndexer) Index(parsed parser.ParsedPage) {
 
 	shard.documents[docID] = doc
 	shard.docCount++
-	atomic.AddInt32(&si.docCount, 1)
 
 	positions := make(map[string][]int)
 	for pos, token := range tokens {
@@ -109,107 +179,64 @@ func (si *ShardedIndexer) Index(parsed parser.ParsedPage) {
 	}
 
 	for term, posList := range positions {
-		posting := Posting{
+		shard.invertedIndex[term] = append(shard.invertedIndex[term], Posting{
 			DocID:     docID,
 			TF:        len(posList),
 			Positions: posList,
-		}
-		shard.invertedIndex[term] = append(shard.invertedIndex[term], posting)
+		})
 	}
+
+	idx.mu.Lock()
+	idx.docCount++
+	idx.mu.Unlock()
 }
 
-func (si *ShardedIndexer) getShardIndex(docID string) int {
-	hash := 0
-	for i, c := range docID {
-		hash = hash*31 + int(c)*i
-	}
-	return hash % int(si.numShards)
-}
-
-func (si *ShardedIndexer) tokenize(text string) []string {
-	text = strings.ToLower(text)
-	tokens := tokenizer.FindAllString(text, -1)
-
-	var filtered []string
-	for _, token := range tokens {
-		if len(token) > 2 && !isStopWord(token) {
-			filtered = append(filtered, token)
-		}
-	}
-	return filtered
-}
-
-func (si *ShardedIndexer) Search(query string, limit int) ([]SearchResult, time.Duration) {
+func (idx *ShardedIndexer) Search(query string, limit int) ([]SearchResult, time.Duration) {
 	start := time.Now()
-	results := si.search(query, limit)
+	results := idx.searchTFIDF(query, limit)
 	return results, time.Since(start)
 }
 
-func (si *ShardedIndexer) search(query string, limit int) []SearchResult {
-	queryTokens := si.tokenize(query)
+func (idx *ShardedIndexer) SearchBM25(query string, limit int) ([]SearchResult, time.Duration) {
+	bm25 := NewBM25(idx)
+	return bm25.Search(query, limit)
+}
+
+func (idx *ShardedIndexer) searchTFIDF(query string, limit int) []SearchResult {
+	queryTokens := idx.tokenize(query)
 	if len(queryTokens) == 0 {
+		return nil
+	}
+
+	idx.mu.RLock()
+	totalDocs := idx.docCount
+	idx.mu.RUnlock()
+	if totalDocs == 0 {
 		return nil
 	}
 
 	docScores := make(map[string]float64)
 
 	for _, token := range queryTokens {
-		for shardIdx := 0; shardIdx < int(si.numShards); shardIdx++ {
-			shard := si.shards[shardIdx]
+		for _, shardID := range idx.shardIDs {
+			shard := idx.shards[shardID]
 			shard.mu.RLock()
-			postings, ok := shard.invertedIndex[token]
-			if !ok {
+			postings := shard.invertedIndex[token]
+			if len(postings) == 0 {
 				shard.mu.RUnlock()
 				continue
 			}
 
-			df := float64(len(postings))
-			N := float64(atomic.LoadInt32(&si.docCount))
-			idf := math.Log(N / df)
-
+			idf := math.Log(float64(totalDocs) / float64(len(postings)))
 			for _, posting := range postings {
 				tf := 1 + math.Log(float64(posting.TF))
-				score := tf * idf
-				docScores[posting.DocID] += score
+				docScores[posting.DocID] += tf * idf
 			}
 			shard.mu.RUnlock()
 		}
 	}
 
-	type scoredDoc struct {
-		docID string
-		score float64
-	}
-
-	var results []scoredDoc
-	for docID, score := range docScores {
-		results = append(results, scoredDoc{docID, score})
-	}
-
-	for i := 0; i < len(results)-1; i++ {
-		for j := i + 1; j < len(results); j++ {
-			if results[j].score > results[i].score {
-				results[i], results[j] = results[j], results[i]
-			}
-		}
-	}
-
-	var searchResults []SearchResult
-	for i := 0; i < len(results) && i < limit; i++ {
-		doc := si.getDoc(results[i].docID)
-		if doc == nil {
-			continue
-		}
-		searchResults = append(searchResults, SearchResult{
-			DocID:   doc.ID,
-			URL:     doc.URL,
-			Title:   doc.Title,
-			Score:   results[i].score,
-			Snippet: createSnippet(doc.Text, queryTokens),
-		})
-	}
-
-	return searchResults
+	return idx.buildResults(docScores, queryTokens, limit)
 }
 
 type BM25 struct {
@@ -219,11 +246,7 @@ type BM25 struct {
 }
 
 func NewBM25(idx *ShardedIndexer) *BM25 {
-	return &BM25{
-		idx: idx,
-		k1:  1.5,
-		b:   0.75,
-	}
+	return &BM25{idx: idx, k1: 1.5, b: 0.75}
 }
 
 func (bm *BM25) Search(query string, limit int) ([]SearchResult, time.Duration) {
@@ -238,60 +261,81 @@ func (bm *BM25) search(query string, limit int) []SearchResult {
 		return nil
 	}
 
-	N := float64(bm.idx.DocCount())
-	if N == 0 {
+	totalDocs := bm.idx.DocCount()
+	if totalDocs == 0 {
 		return nil
 	}
 
 	avgDL := bm.avgDocLength()
+	if avgDL == 0 {
+		return nil
+	}
+
 	docScores := make(map[string]float64)
 
 	for _, token := range queryTokens {
-		for shardIdx := 0; shardIdx < bm.idx.NumShards(); shardIdx++ {
-			shard := bm.idx.shards[shardIdx]
+		for _, shardID := range bm.idx.shardIDs {
+			shard := bm.idx.shards[shardID]
 			shard.mu.RLock()
-			postings, ok := shard.invertedIndex[token]
-			if !ok {
+			postings := shard.invertedIndex[token]
+			if len(postings) == 0 {
 				shard.mu.RUnlock()
 				continue
 			}
 
 			df := float64(len(postings))
-			idf := math.Log((N - df + 0.5) / (df + 0.5))
-
+			idf := math.Log((float64(totalDocs)-df+0.5)/(df+0.5) + 1)
 			for _, posting := range postings {
-				docID := posting.DocID
+				doc := shard.documents[posting.DocID]
+				if doc == nil {
+					continue
+				}
 				tf := float64(posting.TF)
-				dl := float64(len(bm.idx.shards[shardIdx].documents[docID].Tokens))
-
+				dl := float64(len(doc.Tokens))
 				tfScore := (tf * (bm.k1 + 1)) / (tf + bm.k1*(1-bm.b+bm.b*dl/avgDL))
-				docScores[docID] += tfScore * idf
+				docScores[posting.DocID] += tfScore * idf
 			}
 			shard.mu.RUnlock()
 		}
 	}
 
-	type scoredDoc struct {
-		docID string
-		score float64
-	}
+	return bm.idx.buildResults(docScores, queryTokens, limit)
+}
 
-	var results []scoredDoc
-	for docID, score := range docScores {
-		results = append(results, scoredDoc{docID, score})
-	}
+func (bm *BM25) avgDocLength() float64 {
+	totalLength := 0
+	totalDocs := 0
 
-	for i := 0; i < len(results)-1; i++ {
-		for j := i + 1; j < len(results); j++ {
-			if results[j].score > results[i].score {
-				results[i], results[j] = results[j], results[i]
-			}
+	for _, shardID := range bm.idx.shardIDs {
+		shard := bm.idx.shards[shardID]
+		shard.mu.RLock()
+		for _, doc := range shard.documents {
+			totalLength += len(doc.Tokens)
+			totalDocs++
 		}
+		shard.mu.RUnlock()
 	}
 
-	var searchResults []SearchResult
+	if totalDocs == 0 {
+		return 0
+	}
+
+	return float64(totalLength) / float64(totalDocs)
+}
+
+func (idx *ShardedIndexer) buildResults(docScores map[string]float64, queryTokens []string, limit int) []SearchResult {
+	results := make([]scoredDoc, 0, len(docScores))
+	for docID, score := range docScores {
+		results = append(results, scoredDoc{docID: docID, score: score})
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].score > results[j].score
+	})
+
+	searchResults := make([]SearchResult, 0, min(limit, len(results)))
 	for i := 0; i < len(results) && i < limit; i++ {
-		doc := bm.idx.getDoc(results[i].docID)
+		doc := idx.getDoc(results[i].docID)
 		if doc == nil {
 			continue
 		}
@@ -307,162 +351,157 @@ func (bm *BM25) search(query string, limit int) []SearchResult {
 	return searchResults
 }
 
-func (bm *BM25) avgDocLength() float64 {
-	if bm.idx.DocCount() == 0 {
-		return 0
+func (idx *ShardedIndexer) getDoc(docID string) *Document {
+	shardID := idx.getShardIndex(docID)
+	shard := idx.shards[shardID]
+	if shard == nil {
+		return nil
 	}
-	total := 0
-	for shardIdx := 0; shardIdx < bm.idx.NumShards(); shardIdx++ {
-		for _, doc := range bm.idx.shards[shardIdx].documents {
-			total += len(doc.Tokens)
-		}
-	}
-	return float64(total) / float64(bm.idx.DocCount())
-}
 
-func (si *ShardedIndexer) getDoc(docID string) *Document {
-	shardIdx := si.getShardIndex(docID)
-	shard := si.shards[shardIdx]
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()
 	return shard.documents[docID]
 }
 
-func (si *ShardedIndexer) DocCount() int {
-	return int(atomic.LoadInt32(&si.docCount))
-}
-
-func (si *ShardedIndexer) NumShards() int {
-	return int(si.numShards)
-}
-
-func (si *ShardedIndexer) Save(dir string) error {
-	if err := os.MkdirAll(dir, 0755); err != nil {
+func (idx *ShardedIndexer) Save(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 
-	for shardIdx := 0; shardIdx < int(si.numShards); shardIdx++ {
-		shardDir := filepath.Join(dir, fmt.Sprintf("shard_%d", shardIdx))
-		if err := os.MkdirAll(shardDir, 0755); err != nil {
+	for _, shardID := range idx.shardIDs {
+		shard := idx.shards[shardID]
+		shardDir := filepath.Join(dir, fmt.Sprintf("shard_%d", shardID))
+		if err := os.MkdirAll(shardDir, 0o755); err != nil {
 			return err
 		}
 
-		shard := si.shards[shardIdx]
+		shard.mu.RLock()
+		if err := writeGob(filepath.Join(shardDir, "documents.gob"), shard.documents); err != nil {
+			shard.mu.RUnlock()
+			return err
+		}
+		if err := writeGob(filepath.Join(shardDir, "inverted_index.gob"), shard.invertedIndex); err != nil {
+			shard.mu.RUnlock()
+			return err
+		}
+		shard.mu.RUnlock()
+	}
+
+	meta := shardMetadata{
+		TotalShards:  idx.totalShards,
+		LoadedShards: idx.ShardIDs(),
+		DocCount:     idx.DocCount(),
+	}
+
+	return writeGob(filepath.Join(dir, "metadata.gob"), meta)
+}
+
+func (idx *ShardedIndexer) Load(dir string) error {
+	var meta shardMetadata
+	if err := readGob(filepath.Join(dir, "metadata.gob"), &meta); err != nil {
+		return err
+	}
+	if meta.TotalShards != idx.totalShards {
+		return fmt.Errorf("total shard mismatch: have %d want %d", meta.TotalShards, idx.totalShards)
+	}
+
+	loadedDocs := 0
+	for _, shardID := range idx.shardIDs {
+		shard := idx.shards[shardID]
+		if shard == nil {
+			shard = newShard()
+			idx.shards[shardID] = shard
+		}
+
+		shardDir := filepath.Join(dir, fmt.Sprintf("shard_%d", shardID))
 		shard.mu.Lock()
-
-		docsFile, err := os.Create(filepath.Join(shardDir, "documents.gob"))
-		if err != nil {
+		if err := readGob(filepath.Join(shardDir, "documents.gob"), &shard.documents); err != nil {
+			shard.mu.Unlock()
 			return err
 		}
-		enc := gob.NewEncoder(docsFile)
-		if err := enc.Encode(shard.documents); err != nil {
+		if err := readGob(filepath.Join(shardDir, "inverted_index.gob"), &shard.invertedIndex); err != nil {
+			shard.mu.Unlock()
 			return err
 		}
-		docsFile.Close()
-
-		indexFile, err := os.Create(filepath.Join(shardDir, "inverted_index.gob"))
-		if err != nil {
-			return err
-		}
-		enc = gob.NewEncoder(indexFile)
-		if err := enc.Encode(shard.invertedIndex); err != nil {
-			return err
-		}
-		indexFile.Close()
-
+		shard.docCount = len(shard.documents)
+		loadedDocs += shard.docCount
 		shard.mu.Unlock()
 	}
 
-	metadataFile, err := os.Create(filepath.Join(dir, "metadata.gob"))
-	if err != nil {
-		return err
-	}
-	enc := gob.NewEncoder(metadataFile)
-	if err := enc.Encode(struct {
-		NumShards int
-		DocCount  int
-	}{int(si.numShards), int(si.docCount)}); err != nil {
-		return err
-	}
-	metadataFile.Close()
-
+	idx.mu.Lock()
+	idx.docCount = loadedDocs
+	idx.mu.Unlock()
 	return nil
 }
 
-func (si *ShardedIndexer) Load(dir string) error {
-	metadataFile, err := os.Open(filepath.Join(dir, "metadata.gob"))
+func newShard() *Shard {
+	return &Shard{
+		documents:     make(map[string]*Document),
+		invertedIndex: make(map[string][]Posting),
+	}
+}
+
+func writeGob(path string, value any) error {
+	file, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	dec := gob.NewDecoder(metadataFile)
-	var meta struct {
-		NumShards int
-		DocCount  int
-	}
-	if err := dec.Decode(&meta); err != nil {
+	defer file.Close()
+
+	return gob.NewEncoder(file).Encode(value)
+}
+
+func readGob(path string, target any) error {
+	file, err := os.Open(path)
+	if err != nil {
 		return err
 	}
-	metadataFile.Close()
+	defer file.Close()
 
-	if meta.NumShards != int(si.numShards) {
-		return fmt.Errorf("shard count mismatch: have %d, want %d", meta.NumShards, si.numShards)
-	}
-
-	atomic.StoreInt32(&si.docCount, int32(meta.DocCount))
-
-	for shardIdx := 0; shardIdx < int(si.numShards); shardIdx++ {
-		shardDir := filepath.Join(dir, fmt.Sprintf("shard_%d", shardIdx))
-
-		docsFile, err := os.Open(filepath.Join(shardDir, "documents.gob"))
-		if err != nil {
-			return err
-		}
-		dec = gob.NewDecoder(docsFile)
-		if err := dec.Decode(&si.shards[shardIdx].documents); err != nil {
-			return err
-		}
-		docsFile.Close()
-
-		indexFile, err := os.Open(filepath.Join(shardDir, "inverted_index.gob"))
-		if err != nil {
-			return err
-		}
-		dec = gob.NewDecoder(indexFile)
-		if err := dec.Decode(&si.shards[shardIdx].invertedIndex); err != nil {
-			return err
-		}
-		indexFile.Close()
-
-		si.shards[shardIdx].docCount = len(si.shards[shardIdx].documents)
-	}
-
-	return nil
+	return gob.NewDecoder(file).Decode(target)
 }
 
 func generateDocID(url string) string {
+	return strings.ToLower(strings.TrimPrefix(url, "https://"))
+}
+
+func (idx *ShardedIndexer) getShardIndex(docID string) int {
 	hash := 0
-	for i, c := range url {
-		hash = hash*31 + int(c)*i
+	for i, c := range docID {
+		hash = hash*31 + int(c)*(i+1)
 	}
-	return strings.ToLower(strings.ReplaceAll(url, "https://", ""))
+	return hash % idx.totalShards
+}
+
+func (idx *ShardedIndexer) tokenize(text string) []string {
+	text = strings.ToLower(text)
+	tokens := idx.tokenizer.FindAllString(text, -1)
+	filtered := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		if len(token) > 2 && !isStopWord(token) {
+			filtered = append(filtered, token)
+		}
+	}
+	return filtered
 }
 
 func isStopWord(word string) bool {
-	return word == "the" || word == "is" || word == "at" || word == "which" || word == "on" ||
-		word == "and" || word == "a" || word == "an" || word == "in" || word == "to" ||
-		word == "were" || word == "was" || word == "it" || word == "for" || word == "of" ||
-		word == "or" || word == "as" || word == "by" || word == "this" || word == "with" ||
-		word == "be" || word == "are" || word == "from" || word == "has" || word == "have" ||
-		word == "had" || word == "but" || word == "not" || word == "that" || word == "they"
+	switch word {
+	case "the", "is", "at", "which", "on", "and", "a", "an", "in", "to", "were", "was", "it", "for", "of", "or", "as", "by", "this", "with", "be", "are", "from", "has", "have", "had", "but", "not", "that", "they":
+		return true
+	default:
+		return false
+	}
 }
 
 func createSnippet(text string, queryTokens []string) string {
-	text = strings.ToLower(text)
-	words := strings.Fields(text)
+	words := strings.Fields(strings.ToLower(text))
+	if len(words) == 0 {
+		return ""
+	}
 
 	maxScore := 0
 	bestStart := 0
-
 	for i := 0; i < len(words); i++ {
 		score := 0
 		for j := i; j < len(words) && j < i+50; j++ {
@@ -478,20 +517,10 @@ func createSnippet(text string, queryTokens []string) string {
 		}
 	}
 
-	start := bestStart
-	end := start + 50
-	if start > len(words)-1 {
-		start = 0
-		end = min(50, len(words))
-	}
-	if end > len(words) {
-		end = len(words)
-	}
-
-	snippet := strings.Join(words[start:end], " ")
+	end := min(bestStart+50, len(words))
+	snippet := strings.Join(words[bestStart:end], " ")
 	if len(snippet) > 200 {
-		snippet = snippet[:200] + "..."
+		return snippet[:200] + "..."
 	}
-
 	return snippet
 }

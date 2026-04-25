@@ -1,0 +1,64 @@
+services:
+  shard-service-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.shard-service
+    container_name: shard-service-1
+    environment:
+      PORT: "8080"
+      INDEX_DIR: /app/index_data
+      TOTAL_SHARDS: "16"
+      SHARD_IDS: "0,1,2,3"
+      SERVICE_NAME: shard-service-1
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./index_data:/app/index_data:ro
+
+  shard-service-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.shard-service
+    container_name: shard-service-2
+    environment:
+      PORT: "8080"
+      INDEX_DIR: /app/index_data
+      TOTAL_SHARDS: "16"
+      SHARD_IDS: "4,5,6,7"
+      SERVICE_NAME: shard-service-2
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./index_data:/app/index_data:ro
+
+  shard-service-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.shard-service
+    container_name: shard-service-3
+    environment:
+      PORT: "8080"
+      INDEX_DIR: /app/index_data
+      TOTAL_SHARDS: "16"
+      SHARD_IDS: "8,9,10,11"
+      SERVICE_NAME: shard-service-3
+    ports:
+      - "8083:8080"
+    volumes:
+      - ./index_data:/app/index_data:ro
+
+  shard-service-4:
+    build:
+      context: .
+      dockerfile: Dockerfile.shard-service
+    container_name: shard-service-4
+    environment:
+      PORT: "8080"
+      INDEX_DIR: /app/index_data
+      TOTAL_SHARDS: "16"
+      SHARD_IDS: "12,13,14,15"
+      SERVICE_NAME: shard-service-4
+    ports:
+      - "8084:8080"
+    volumes:
+      - ./index_data:/app/index_data:ro

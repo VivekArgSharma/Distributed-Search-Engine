@@ -10,8 +10,9 @@ import (
 )
 
 func main() {
-	numShards := 16
-	idx := indexer.NewShardedIndexer(numShards)
+	const totalShards = 16
+
+	idx := indexer.NewShardedIndexer(totalShards)
 	c := crawler.NewCrawler("VivekSearchBot/1.0", 100*time.Millisecond)
 
 	seeds := []string{
@@ -27,32 +28,32 @@ func main() {
 		"https://en.wikipedia.org/wiki/Artificial_intelligence",
 	}
 
-	fmt.Printf("Crawling with %d shards...\n", numShards)
-
 	start := time.Now()
-	c.Crawl(seeds, func(p parser.ParsedPage) {
-		idx.Index(p)
-		fmt.Printf("[%d] %s\n", idx.DocCount(), p.Title)
+	count := c.Crawl(seeds, func(page parser.ParsedPage) {
+		if page.URL == "" {
+			return
+		}
+		idx.Index(page)
+		fmt.Printf("[%d] %s\n", idx.DocCount(), page.Title)
 	}, 80, 2)
 
-	fmt.Printf("\nIndexed %d documents in %v\n", idx.DocCount(), time.Since(start))
-	fmt.Printf("Number of shards: %d\n", idx.NumShards())
+	if err := idx.Save("./index_data"); err != nil {
+		panic(err)
+	}
 
-	fmt.Println("\n=== TF-IDF Search: 'programming' ===")
+	fmt.Printf("\nCrawled %d pages\n", count)
+	fmt.Printf("Indexed %d documents in %v\n", idx.DocCount(), time.Since(start))
+	fmt.Printf("Saved %d total shards to ./index_data\n", idx.TotalShards())
+
 	results, dur := idx.Search("programming", 5)
-	fmt.Printf("Took: %v\n", dur)
-	for _, r := range results {
-		fmt.Printf("[%.2f] %s\n", r.Score, r.Title)
+	fmt.Printf("\nTF-IDF 'programming' took %v\n", dur)
+	for _, result := range results {
+		fmt.Printf("[%.2f] %s\n", result.Score, result.Title)
 	}
 
-	fmt.Println("\n=== BM25 Search: 'programming' ===")
-	bm25 := indexer.NewBM25(idx)
-	bmResults, bmDur := bm25.Search("programming", 5)
-	fmt.Printf("Took: %v\n", bmDur)
-	for _, r := range bmResults {
-		fmt.Printf("[%.2f] %s\n", r.Score, r.Title)
+	bm25Results, bm25Dur := idx.SearchBM25("programming", 5)
+	fmt.Printf("\nBM25 'programming' took %v\n", bm25Dur)
+	for _, result := range bm25Results {
+		fmt.Printf("[%.2f] %s\n", result.Score, result.Title)
 	}
-
-	_ = idx.Save("./index_data")
-	fmt.Println("\nIndex saved to ./index_data")
 }

@@ -1,0 +1,22 @@
+FROM golang:1.26.2 AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY crawler ./crawler
+COPY distributed ./distributed
+COPY indexer ./indexer
+COPY parser ./parser
+COPY cmd ./cmd
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /bin/shard-service ./cmd/shard-service
+
+FROM debian:bookworm-slim
+
+WORKDIR /app
+COPY --from=builder /bin/shard-service /usr/local/bin/shard-service
+
+EXPOSE 8080
+
+CMD ["shard-service"]
