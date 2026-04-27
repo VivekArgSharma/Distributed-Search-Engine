@@ -11,7 +11,7 @@ export const options = {
   duration: __ENV.DURATION || '30s',
   thresholds: {
     http_req_failed: ['rate<0.01'],
-    http_req_duration: ['p(50)<100', 'p(95)<250'],
+    http_req_duration: ['p(50)<100', 'p(95)<100'],
   },
   summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
 };

@@ -1,0 +1,23 @@
+FROM golang:1.26.2 AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY crawler ./crawler
+COPY distributed ./distributed
+COPY indexer ./indexer
+COPY parser ./parser
+COPY cache ./cache
+COPY cmd ./cmd
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /bin/query-service ./cmd/query-service
+
+FROM debian:bookworm-slim
+
+WORKDIR /app
+COPY --from=builder /bin/query-service /usr/local/bin/query-service
+
+EXPOSE 8090
+
+CMD ["query-service"]

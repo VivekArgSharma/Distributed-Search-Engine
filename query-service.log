@@ -1,1 +1,5 @@
-2026/04/25 17:39:16 query-service listening on :8090
+2026/04/27 19:54:04 redis cache enabled at localhost:6379 with TTL 5m0s
+2026/04/27 19:54:04 query-service listening on :8090
+exit status 1
+54:04 listen tcp :8090: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted.
+exit status 1

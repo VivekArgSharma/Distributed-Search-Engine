@@ -16,17 +16,18 @@ func main() {
 	limit := flag.Int("limit", 5, "max number of results")
 	mode := flag.String("mode", string(indexer.SearchModeBM25), "search mode: tfidf or bm25")
 	servicesArg := flag.String("services", defaultServices(), "comma-separated shard service URLs")
+	hotShard := flag.Bool("hot-shard", false, "enable hot shard routing")
 	flag.Parse()
 
-	client := distributed.NewClient(strings.Split(*servicesArg, ","))
-	results, took, err := client.Search(*query, *limit, indexer.SearchMode(*mode))
-	if err != nil {
-		log.Fatal(err)
+	client := distributed.NewClient(strings.Split(*servicesArg, ","), *hotShard, 20, 0.5)
+	result := client.SearchEx(*query, *limit, indexer.SearchMode(*mode))
+	if result.Error != nil {
+		log.Fatal(result.Error)
 	}
 
-	fmt.Printf("Distributed %s search for %q took %v\n", *mode, *query, took)
-	for _, result := range results {
-		fmt.Printf("[%.2f] %s\n  %s\n\n", result.Score, result.Title, result.URL)
+	fmt.Printf("Distributed %s search for %q took %v (shards: %v, hot: %v)\n", *mode, *query, result.Duration, result.ShardIDs, result.HotShard)
+	for _, r := range result.Results {
+		fmt.Printf("[%.2f] %s\n  %s\n\n", r.Score, r.Title, r.URL)
 	}
 }
 

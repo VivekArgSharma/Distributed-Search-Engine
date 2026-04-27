@@ -71,5 +71,24 @@ services:
     volumes:
       - redis_data:/data
 
+  query-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.query-service
+    container_name: query-service
+    environment:
+      PORT: "8090"
+      REDIS_ADDR: "redis:6379"
+      SHARD_SERVICES: "http://shard-service-1:8080,http://shard-service-2:8080,http://shard-service-3:8080,http://shard-service-4:8080"
+      ENABLE_HOT_SHARD: "true"
+    ports:
+      - "8090:8090"
+    depends_on:
+      - redis
+      - shard-service-1
+      - shard-service-2
+      - shard-service-3
+      - shard-service-4
+
 volumes:
   redis_data:

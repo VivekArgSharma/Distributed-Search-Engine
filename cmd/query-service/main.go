@@ -16,17 +16,24 @@ import (
 )
 
 type response struct {
-	Query   string                 `json:"query"`
-	Mode    string                 `json:"mode"`
-	Took    string                 `json:"took"`
-	From    string                 `json:"from"`
-	Results []indexer.SearchResult `json:"results"`
+	Query    string                 `json:"query"`
+	Mode     string                 `json:"mode"`
+	Took     string                 `json:"took"`
+	From     string                 `json:"from"`
+	Shards   []int                  `json:"shards,omitempty"`
+	HotShard bool                   `json:"hot_shard,omitempty"`
+	Results  []indexer.SearchResult `json:"results"`
 }
 
 func main() {
 	port := envOrDefault("PORT", "8090")
 	services := strings.Split(envOrDefault("SHARD_SERVICES", "http://localhost:8081,http://localhost:8082,http://localhost:8083,http://localhost:8084"), ",")
-	client := distributed.NewClient(services)
+
+	enableHotShard := envOrDefault("ENABLE_HOT_SHARD", "true") == "true"
+	minQueries := 20
+	confidence := 0.5
+
+	client := distributed.NewClient(services, enableHotShard, minQueries, confidence)
 
 	var queryCache *cache.Cache
 	redisAddr := envOrDefault("REDIS_ADDR", "localhost:6379")
@@ -56,6 +63,15 @@ func main() {
 			status["cache"] = "enabled"
 		} else {
 			status["cache"] = "disabled"
+		}
+		if enableHotShard {
+			qc, tc, sc := client.HotShardStats()
+			status["hot_shard"] = map[string]any{
+				"enabled": true,
+				"queries": qc,
+				"terms":   tc,
+				"shards":  sc,
+			}
 		}
 		writeJSON(w, http.StatusOK, status)
 	})
@@ -97,27 +113,29 @@ func main() {
 			}
 		}
 
-		results, took, err := client.Search(query, limit, mode)
-		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		result := client.SearchEx(query, limit, mode)
+		if result.Error != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": result.Error.Error()})
 			return
 		}
 
 		if queryCache != nil {
 			go func() {
 				_ = queryCache.Set(context.Background(), query, mode, limit, &cache.CacheResult{
-					Results: results,
-					Took:    took.String(),
+					Results: result.Results,
+					Took:    result.Duration.String(),
 				})
 			}()
 		}
 
 		writeJSON(w, http.StatusOK, response{
-			Query:   query,
-			Mode:    string(mode),
-			Took:    took.String(),
-			From:    "search",
-			Results: results,
+			Query:    query,
+			Mode:     string(mode),
+			Took:     result.Duration.String(),
+			From:     "search",
+			Shards:   result.ShardIDs,
+			HotShard: result.HotShard,
+			Results:  result.Results,
 		})
 	})
 
