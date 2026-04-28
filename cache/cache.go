@@ -25,8 +25,9 @@ type CacheResult struct {
 
 func NewCache(addr string, ttl time.Duration) *Cache {
 	client := redis.NewClient(&redis.Options{
-		Addr:     addr,
-		PoolSize: 10,
+		Addr:         addr,
+		PoolSize:     50,
+		MinIdleConns: 10,
 	})
 	return &Cache{
 		client: client,

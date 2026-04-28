@@ -166,8 +166,14 @@ func NewClient(services []string, enableHotShard bool, minQueries int, confidenc
 		tracker = NewHotShardTracker(minQueries, confidence)
 	}
 
+	transport := &http.Transport{
+		MaxIdleConnsPerHost: 100,
+		MaxConnsPerHost:     100,
+		IdleConnTimeout:     30 * time.Second,
+	}
+
 	return &Client{
-		httpClient:      &http.Client{Timeout: 10 * time.Second},
+		httpClient:      &http.Client{Timeout: 10 * time.Second, Transport: transport},
 		services:        cleaned,
 		serviceShardIDs: serviceShardIDs,
 		hotTracker:      tracker,
