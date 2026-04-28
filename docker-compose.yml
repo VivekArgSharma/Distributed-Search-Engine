@@ -1,4 +1,5 @@
 services:
+  # Primary shard services
   shard-service-1:
     build:
       context: .
@@ -14,6 +15,12 @@ services:
       - "8081:8080"
     volumes:
       - ./index_data:/app/index_data:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   shard-service-2:
     build:
@@ -30,6 +37,12 @@ services:
       - "8082:8080"
     volumes:
       - ./index_data:/app/index_data:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   shard-service-3:
     build:
@@ -46,6 +59,12 @@ services:
       - "8083:8080"
     volumes:
       - ./index_data:/app/index_data:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   shard-service-4:
     build:
@@ -62,6 +81,119 @@ services:
       - "8084:8080"
     volumes:
       - ./index_data:/app/index_data:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # Replica shard services
+  shard-service-1-replica:
+    build:
+      context: .
+      dockerfile: Dockerfile.shard-service
+    container_name: shard-service-1-replica
+    environment:
+      PORT: "8080"
+      INDEX_DIR: /app/index_data
+      TOTAL_SHARDS: "16"
+      SHARD_IDS: "0,1,2,3"
+      SERVICE_NAME: shard-service-1-replica
+    volumes:
+      - ./index_data:/app/index_data:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  shard-service-2-replica:
+    build:
+      context: .
+      dockerfile: Dockerfile.shard-service
+    container_name: shard-service-2-replica
+    environment:
+      PORT: "8080"
+      INDEX_DIR: /app/index_data
+      TOTAL_SHARDS: "16"
+      SHARD_IDS: "4,5,6,7"
+      SERVICE_NAME: shard-service-2-replica
+    volumes:
+      - ./index_data:/app/index_data:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  shard-service-3-replica:
+    build:
+      context: .
+      dockerfile: Dockerfile.shard-service
+    container_name: shard-service-3-replica
+    environment:
+      PORT: "8080"
+      INDEX_DIR: /app/index_data
+      TOTAL_SHARDS: "16"
+      SHARD_IDS: "8,9,10,11"
+      SERVICE_NAME: shard-service-3-replica
+    volumes:
+      - ./index_data:/app/index_data:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  shard-service-4-replica:
+    build:
+      context: .
+      dockerfile: Dockerfile.shard-service
+    container_name: shard-service-4-replica
+    environment:
+      PORT: "8080"
+      INDEX_DIR: /app/index_data
+      TOTAL_SHARDS: "16"
+      SHARD_IDS: "12,13,14,15"
+      SERVICE_NAME: shard-service-4-replica
+    volumes:
+      - ./index_data:/app/index_data:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # Nginx load balancer
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    container_name: nginx
+    ports:
+      - "8080:8080"
+    depends_on:
+      shard-service-1:
+        condition: service_healthy
+      shard-service-2:
+        condition: service_healthy
+      shard-service-3:
+        condition: service_healthy
+      shard-service-4:
+        condition: service_healthy
+      shard-service-1-replica:
+        condition: service_healthy
+      shard-service-2-replica:
+        condition: service_healthy
+      shard-service-3-replica:
+        condition: service_healthy
+      shard-service-4-replica:
+        condition: service_healthy
 
   redis:
     image: redis:7-alpine
@@ -71,6 +203,7 @@ services:
     volumes:
       - redis_data:/data
 
+  # Query service using nginx as backend
   query-service:
     build:
       context: .
@@ -79,16 +212,14 @@ services:
     environment:
       PORT: "8090"
       REDIS_ADDR: "redis:6379"
-      SHARD_SERVICES: "http://shard-service-1:8080,http://shard-service-2:8080,http://shard-service-3:8080,http://shard-service-4:8080"
+      # Now uses nginx as single entry point instead of directly calling shards
+      SHARD_SERVICES: "http://nginx:8080"
       ENABLE_HOT_SHARD: "true"
     ports:
       - "8090:8090"
     depends_on:
       - redis
-      - shard-service-1
-      - shard-service-2
-      - shard-service-3
-      - shard-service-4
+      - nginx
 
 volumes:
   redis_data:
