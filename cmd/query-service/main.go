@@ -55,8 +55,9 @@ func main() {
 	}
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		serviceName := envOrDefault("SERVICE_NAME", "query-service")
 		status := map[string]any{
-			"service":   "query-service",
+			"service":   serviceName,
 			"upstreams": services,
 		}
 		if queryCache != nil {

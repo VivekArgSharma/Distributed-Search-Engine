@@ -169,7 +169,7 @@ services:
       retries: 3
       start_period: 15s
 
-  # Nginx load balancer
+  # Shard nginx load balancer
   nginx:
     build:
       context: .
@@ -203,7 +203,7 @@ services:
     volumes:
       - redis_data:/data
 
-  # Query service using nginx as backend
+  # Single query service
   query-service:
     build:
       context: .
@@ -212,7 +212,6 @@ services:
     environment:
       PORT: "8090"
       REDIS_ADDR: "redis:6379"
-      # Now uses nginx as single entry point instead of directly calling shards
       SHARD_SERVICES: "http://nginx:8080"
       ENABLE_HOT_SHARD: "true"
     ports:

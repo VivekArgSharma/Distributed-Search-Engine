@@ -29,7 +29,7 @@ func main() {
 
 	// Test with 70% hot queries
 	hotRatio := 0.7
-	workers := 50
+	workers := 75
 
 	var total, hotCount, coldCount int64
 	var latencies []float64
